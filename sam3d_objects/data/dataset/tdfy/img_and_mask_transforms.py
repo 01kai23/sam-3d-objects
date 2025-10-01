@@ -522,3 +522,89 @@ def normalize_pointmap_ssi(pointmap: torch.Tensor) -> tuple[torch.Tensor, torch.
         pointmap_normalized = pointmap_normalized.reshape(pointmap_hw3.shape)
     
     return pointmap_normalized, scale, shift
+
+
+def perturb_mask_translation(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    max_px_delta: int = 5,
+):
+    """
+    Applies data augmentation to the mask by randomly translating the mask.
+
+    Args:
+        image: (C, H, W) float32 [0, 1] tensor.
+        mask: (1, H, W) float32 [0, 1] tensor.
+        max_px_delta: The maximum number of pixels we will randomly shift by in each 2D direction.
+    """
+    dx = random.randint(-max_px_delta, max_px_delta)
+    dy = random.randint(-max_px_delta, max_px_delta)
+
+    mask = mask.squeeze(0)
+    mask = torch.roll(mask, shifts=(dy, dx), dims=(0, 1))
+    
+    # Zero out wrapped regions
+    if dy > 0:
+        mask[:dy, :] = 0
+    elif dy < 0:
+        mask[dy:, :] = 0
+    if dx > 0:
+        mask[:, :dx] = 0
+    elif dx < 0:
+        mask[:, dx:] = 0
+    
+    mask = mask.unsqueeze(0)
+    return image, mask
+
+
+def perturb_mask_boundary(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    kernel_range: tuple[int, int] = (2, 5),
+    p_erode: float = 0.1,
+    p_dilate: float = 0.8,
+    **kwargs,
+):
+    """
+    Applies data augmentation to the mask by randomly eroding or dilating the mask.
+
+    Args:
+        image: (C, H, W) float32 [0, 1] tensor.
+        mask: (1, H, W) float32 [0, 1] tensor.
+        kernel_range: Range of kernel sizes to sample from.
+        p_erode: Probability of erosion.
+        p_dilate: Probability of dilation.
+        kwargs: Kwargs for the cv2 erode/dilate function.
+    """
+    import cv2
+
+    C, H, W = image.shape
+    assert mask.shape == (1, H, W)
+    assert mask.dtype == torch.float32
+    assert torch.all((mask == 0) | (mask == 1)), "Mask must be binary (0 or 1)"
+
+    p_none = 1.0 - p_erode - p_dilate
+    assert 0 <= p_none <= 1, "Probabilities must sum to 1 and be valid."
+
+    # Sample operation.
+    op = random.choices(["erode", "dilate", "none"], weights=[p_erode, p_dilate, p_none], k=1)[0]
+    
+    if op == "none":
+        pass
+    else:
+        # Sample kernel size
+        ksize = random.randint(*kernel_range)
+        kernel = np.ones((ksize, ksize), np.uint8)
+
+        mask = mask.squeeze().cpu().numpy().astype(np.uint8)  # (H, W)
+
+        if op == "erode":
+            mask = cv2.erode(mask, kernel, **kwargs)
+        elif op == "dilate":
+            mask = cv2.dilate(mask, kernel, **kwargs)
+        else:
+            raise NotImplementedError
+
+        mask = torch.from_numpy(mask).float()[None]  # (1, H, W)
+
+    return image, mask

@@ -17,6 +17,7 @@ def __from_env():
     if env_attn_backend is not None and env_attn_backend in [
         "xformers",
         "flash_attn",
+        "torch_flash_attn",
         "sdpa",
         "naive",
     ]:
@@ -31,7 +32,7 @@ def __from_env():
 __from_env()
 
 
-def set_backend(backend: Literal["xformers", "flash_attn"]):
+def set_backend(backend: Literal["xformers", "flash_attn", "torch_flash_attn"]):
     global BACKEND
     BACKEND = backend
 

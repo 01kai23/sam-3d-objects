@@ -351,6 +351,8 @@ class InferencePipelinePointMap(InferencePipeline):
         use_vertex_color=False,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
+        use_stage1_distillation=False,
+        use_stage2_distillation=False,
         pointmap=None,
         decode_formats=None,
     ) -> dict:
@@ -376,7 +378,9 @@ class InferencePipelinePointMap(InferencePipeline):
             if seed is not None:
                 torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
-                ss_input_dict, inference_steps=stage1_inference_steps
+                ss_input_dict,
+                inference_steps=stage1_inference_steps,
+                use_distillation=use_stage1_distillation,
             )
 
             # This is for decoupling oriented shape and layout model
@@ -385,6 +389,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 layout_input_dict,
                 ss_return_dict,
                 inference_steps=stage1_inference_steps,
+                use_distillation=use_stage1_distillation,
             )
             ss_return_dict.update(layout_return_dict)
             ss_return_dict.update(
@@ -402,7 +407,10 @@ class InferencePipelinePointMap(InferencePipeline):
 
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(
-                slat_input_dict, coords, inference_steps=stage2_inference_steps
+                slat_input_dict,
+                coords,
+                inference_steps=stage2_inference_steps,
+                use_distillation=use_stage2_distillation,
             )
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats

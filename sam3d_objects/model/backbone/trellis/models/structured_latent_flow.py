@@ -95,6 +95,7 @@ class SLatFlowModel(nn.Module):
         share_mod: bool = False,
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
+        is_shortcut_model: bool = False,
     ):
         super().__init__()
         self.resolution = resolution
@@ -115,7 +116,11 @@ class SLatFlowModel(nn.Module):
         self.share_mod = share_mod
         self.qk_rms_norm = qk_rms_norm
         self.qk_rms_norm_cross = qk_rms_norm_cross
+        self.is_shortcut_model = is_shortcut_model
         self.dtype = torch.float16 if use_fp16 else torch.float32
+        if is_shortcut_model:
+            self.d_embedder = TimestepEmbedder(model_channels) # for shortcut model
+            
 
         assert int(np.log2(patch_size)) == np.log2(
             patch_size
@@ -241,6 +246,11 @@ class SLatFlowModel(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        # # zero init like controlnet, for MLP should only zero 
+        # # the weight of the last layer only
+        # if self.is_shortcut_model:
+        #     nn.init.constant_(self.d_embedder.mlp[2].weight, 0)
+
         # Zero-out adaLN modulation layers in DiT blocks:
         if self.share_mod:
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
@@ -255,10 +265,13 @@ class SLatFlowModel(nn.Module):
         nn.init.constant_(self.out_layer.bias, 0)
 
     def forward(
-        self, x: sp.SparseTensor, t: torch.Tensor, cond: torch.Tensor
+        self, x: sp.SparseTensor, t: torch.Tensor, cond: torch.Tensor, d: torch.Tensor = None
     ) -> sp.SparseTensor:
         h = self.input_layer(x).type(self.dtype)
         t_emb = self.t_embedder(t)
+        if d is not None:
+            d_emb = self.d_embedder(d)
+            t_emb = t_emb + d_emb
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)
         t_emb = t_emb.type(self.dtype)
@@ -309,7 +322,9 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
         *condition_args,
         **condition_kwargs,
     ) -> torch.Tensor:
+        # Extract d from kwargs_conditionals if present, for shortcut model
         if not torch.compiler.is_compiling():
+            d = condition_kwargs.pop("d", None)
             if "coords" in condition_kwargs:
                 coords = condition_kwargs["coords"]
                 del condition_kwargs["coords"]
@@ -319,6 +334,8 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
         else:
             coords = condition_args[-1]
             condition_args = condition_args[:-1]
+            d = condition_kwargs.pop("d", None)
+            
         coords = torch.tensor(coords).to(x.device)
         x = sp.SparseTensor(
             feats=x[0],
@@ -331,6 +348,6 @@ class SLatFlowModelTdfyWrapper(SLatFlowModel):
             cond = cond * 0
         else:
             cond = self.condition_embedder(*condition_args, **condition_kwargs)
-        h = super().forward(x, t, cond)
+        h = super().forward(x, t, cond, d)
         h = h.feats[None]
         return h

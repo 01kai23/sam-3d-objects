@@ -51,6 +51,7 @@ class PreProcessor:
     img_transform: Callable = (None,)
     mask_transform: Callable = (None,)
     img_mask_joint_transform: list[Callable] = (None,)
+    rgb_img_mask_joint_transform: list[Callable] = (None,)
 
     # New fields for pointmap support
     pointmap_transform: Callable = (None,)
@@ -71,6 +72,9 @@ class PreProcessor:
         pointmap_shift = None
         if pointmap is not None and self.normalize_pointmap:
             pointmap, pointmap_scale, pointmap_shift = normalize_pointmap_ssi(pointmap)
+
+        # Apply transforms to the original full rgb image and mask.
+        rgb_image, rgb_image_mask = self._preprocess_rgb_image_mask(rgb_image, rgb_image_mask)
 
         # These two are typically used for getting cropped images of the object
         #   : first apply joint transforms
@@ -125,6 +129,16 @@ class PreProcessor:
     def _process_image_and_mask_mess(self, rgb_image, rgb_image_mask):
         """Original method - calls extended version without pointmap"""
         return self._process_image_mask_pointmap_mess(rgb_image, rgb_image_mask, None)
+
+    def _preprocess_rgb_image_mask(self, rgb_image: torch.Tensor, rgb_image_mask: torch.Tensor):
+        """Apply joint transforms to rgb_image and rgb_image_mask."""
+        if (
+            self.rgb_img_mask_joint_transform != (None,)
+            and self.rgb_img_mask_joint_transform is not None
+        ):
+            for trans in self.rgb_img_mask_joint_transform:
+                rgb_image, rgb_image_mask = trans(rgb_image, rgb_image_mask)
+        return rgb_image, rgb_image_mask
 
     def _preprocess_image_mask_pointmap(self, rgb_image, mask_image, pointmap=None):
         """Apply joint transforms with priority: triple transforms > dual transforms."""

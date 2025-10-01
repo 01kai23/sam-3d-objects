@@ -305,7 +305,7 @@ def pose_decoder(
         _scene_shift = (
             scene_shift
             if scene_shift is not None
-            else torch.tensor([[0, 0, 1.0]], device=device)
+            else torch.tensor([[0, 0, 0]], device=device)
         )
         pose_target_dict["x_scene_scale"] = _scene_scale
         pose_target_dict["x_scene_center"] = _scene_shift

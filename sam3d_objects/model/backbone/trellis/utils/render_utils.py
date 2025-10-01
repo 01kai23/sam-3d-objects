@@ -120,6 +120,37 @@ def render_frames(
     return rets
 
 
+def render_gaussian_color_stay_in_device(
+    sample,
+    extrinsics,
+    intrinsics,
+    options={},
+    colors_overwrite=None,
+    verbose=True,
+    **kwargs,
+):
+    assert isinstance(sample, Gaussian)
+    renderer = GaussianRenderer()
+    renderer.rendering_options.resolution = options.get("resolution", 512)
+    renderer.rendering_options.near = options.get("near", 0.8)
+    renderer.rendering_options.far = options.get("far", 1.6)
+    renderer.rendering_options.bg_color = options.get("bg_color", (0, 0, 0))
+    renderer.rendering_options.ssaa = options.get("ssaa", 1)
+    renderer.rendering_options.backend = options.get("backend", "inria")
+    renderer.pipe.kernel_size = kwargs.get("kernel_size", 0.1)
+    renderer.pipe.use_mip_gaussian = True
+
+    rets = {}
+    for _, (extr, intr) in tqdm(
+        enumerate(zip(extrinsics, intrinsics)), desc="Rendering", disable=not verbose
+    ):
+        res = renderer.render(sample, extr, intr, colors_overwrite=colors_overwrite)
+        color = (res["color"].permute(1, 2, 0) * 255).to(torch.uint8)
+        if "color" not in rets:
+            rets["color"] = []
+        rets["color"].append(color)
+    return rets
+
 def render_video(
     sample,
     resolution=512,

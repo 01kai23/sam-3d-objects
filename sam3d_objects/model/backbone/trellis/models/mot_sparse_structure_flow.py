@@ -33,6 +33,7 @@ class SparseStructureFlowModel(nn.Module):
         qk_rms_norm: bool = False,
         qk_rms_norm_cross: bool = False,
         freeze_shared_parameters: bool = False,
+        is_shortcut_model: bool = False,
         *args,
         **kwargs,
     ):
@@ -51,6 +52,9 @@ class SparseStructureFlowModel(nn.Module):
         self.qk_rms_norm = qk_rms_norm
         self.qk_rms_norm_cross = qk_rms_norm_cross
         self.dtype = FP16_TYPE if use_fp16 else torch.float32
+        self.is_shortcut_model = is_shortcut_model
+        if is_shortcut_model:
+            self.d_embedder = TimestepEmbedder(model_channels) # for shortcut model
 
         self.t_embedder = TimestepEmbedder(model_channels, freeze=freeze_shared_parameters)
         if share_mod:
@@ -115,6 +119,11 @@ class SparseStructureFlowModel(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        # zero init like controlnet, for MLP should only zero 
+        # the weight of the last layer only
+        if self.is_shortcut_model:
+            nn.init.constant_(self.d_embedder.mlp[2].weight, 0)
+
         # Zero-out adaLN modulation layers in DiT blocks:
         if self.share_mod:
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
@@ -132,8 +141,12 @@ class SparseStructureFlowModel(nn.Module):
         h: Dict,
         t: torch.Tensor,
         cond: torch.Tensor,
+        d: torch.Tensor = None,
     ) -> torch.Tensor:
         t_emb = self.t_embedder(t)
+        if d is not None:
+            d_emb = self.d_embedder(d)
+            t_emb = t_emb + d_emb
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)
 
@@ -195,6 +208,8 @@ class SparseStructureFlowTdfyWrapper(SparseStructureFlowModel):
         *condition_args,
         **condition_kwargs,
     ) -> dict:
+        d = condition_kwargs.pop("d", None)
+            
         cfg_activate = condition_kwargs.pop("cfg", False)
         if self.force_zeros_cond and cfg_activate:
             # TODO: @weiyaowang, refactor to read directly from embedder
@@ -205,7 +220,7 @@ class SparseStructureFlowTdfyWrapper(SparseStructureFlowModel):
 
         # concatenate input
         latent_dict = self.project_input(latents_dict)
-        output = super().forward(latent_dict, t, cond)
+        output = super().forward(latent_dict, t, cond, d)
 
         # split input to multiple output modalities
         output_latents = self.project_output(output)

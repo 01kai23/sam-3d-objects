@@ -104,7 +104,7 @@ class InferencePipeline:
         self.device = torch.device(device)
         self.compile_model = compile_model
         logger.info(f"self.device: {self.device}")
-        logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}")
+        logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}")
         logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
         with self.device:  # TODO(Pierre) make with context a decorator ?
             self.decode_formats = decode_formats
@@ -121,6 +121,15 @@ class InferencePipeline:
             self.use_pretrained_slat = use_pretrained_slat
             self.force_shape_in_layout = force_shape_in_layout
             self.downsample_ss_dist = downsample_ss_dist
+            self.ss_inference_steps = ss_inference_steps
+            self.ss_rescale_t = ss_rescale_t
+            self.ss_cfg_strength = ss_cfg_strength
+            self.ss_cfg_interval = ss_cfg_interval
+            self.slat_inference_steps = slat_inference_steps
+            self.slat_rescale_t = slat_rescale_t
+            self.slat_cfg_strength = slat_cfg_strength
+            self.slat_cfg_interval = slat_cfg_interval
+
             self.dtype = self._get_dtype(dtype)
             if layout_model_dtype is None:
                 self.layout_model_dtype = self.dtype
@@ -559,6 +568,8 @@ class InferencePipeline:
         use_vertex_color=False,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
+        use_stage1_distillation=False,
+        use_stage2_distillation=False,
         decode_formats=None,
     ) -> dict:
         """
@@ -579,7 +590,9 @@ class InferencePipeline:
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
-                ss_input_dict, inference_steps=stage1_inference_steps
+                ss_input_dict,
+                inference_steps=stage1_inference_steps,
+                use_distillation=use_stage1_distillation,
             )
 
             # This is for decoupling oriented shape and layout model
@@ -588,6 +601,7 @@ class InferencePipeline:
                 layout_input_dict,
                 ss_return_dict,
                 inference_steps=stage1_inference_steps,
+                use_distillation=use_stage1_distillation,
             )
             ss_return_dict.update(layout_return_dict)
             ss_return_dict.update(self.pose_decoder(ss_return_dict))
@@ -599,7 +613,10 @@ class InferencePipeline:
 
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(
-                slat_input_dict, coords, inference_steps=stage2_inference_steps
+                slat_input_dict,
+                coords,
+                inference_steps=stage2_inference_steps,
+                use_distillation=use_stage2_distillation,
             )
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
@@ -723,9 +740,18 @@ class InferencePipeline:
 
         return condition_args, condition_kwargs
 
-    def sample_sparse_structure(self, ss_input_dict: dict, inference_steps=None):
+    def sample_sparse_structure(
+        self, ss_input_dict: dict, inference_steps=None, use_distillation=False
+    ):
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
+        if use_distillation:
+            ss_generator.no_shortcut = False
+            ss_generator.reverse_fn.strength = 0
+        else:
+            ss_generator.no_shortcut = True
+            ss_generator.reverse_fn.strength = self.ss_cfg_strength
+
         prev_inference_steps = ss_generator.inference_steps
         if inference_steps:
             ss_generator.inference_steps = inference_steps
@@ -790,7 +816,11 @@ class InferencePipeline:
         return return_dict
 
     def run_layout_model(
-        self, ss_input_dict: dict, ss_return_dict: dict, inference_steps=None
+        self,
+        ss_input_dict: dict,
+        ss_return_dict: dict,
+        inference_steps=None,
+        use_distillation=False,
     ):
         if self.models["layout_model"] is None:
             return {}
@@ -798,6 +828,12 @@ class InferencePipeline:
         prev_inference_steps = ss_generator.inference_steps
         if inference_steps:
             ss_generator.inference_steps = inference_steps
+        if use_distillation:
+            ss_generator.no_shortcut = False
+            ss_generator.reverse_fn.strength = 0
+        else:
+            ss_generator.no_shortcut = True
+            ss_generator.reverse_fn.strength = self.ss_cfg_strength
 
         logger.info(
             "Sampling layout model: inference_steps={}, strength={}, interval={}, rescale_t={}",
@@ -882,7 +918,11 @@ class InferencePipeline:
         return return_dict
 
     def sample_slat(
-        self, slat_input: dict, coords: torch.Tensor, inference_steps=25
+        self,
+        slat_input: dict,
+        coords: torch.Tensor,
+        inference_steps=25,
+        use_distillation=False,
     ) -> sp.SparseTensor:
         image = slat_input["image"]
         DEVICE = image.device
@@ -891,6 +931,12 @@ class InferencePipeline:
         prev_inference_steps = slat_generator.inference_steps
         if inference_steps:
             slat_generator.inference_steps = inference_steps
+        if use_distillation:
+            slat_generator.no_shortcut = False
+            slat_generator.reverse_fn.strength = 0
+        else:
+            slat_generator.no_shortcut = True
+            slat_generator.reverse_fn.strength = self.slat_cfg_strength
 
         logger.info(
             "Sampling sparse latent: inference_steps={}, strength={}, interval={}, rescale_t={}",

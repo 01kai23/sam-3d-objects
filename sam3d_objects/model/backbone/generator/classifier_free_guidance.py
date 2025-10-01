@@ -136,4 +136,43 @@ class ClassifierFreeGuidance(torch.nn.Module):
                 return self.inner_forward(
                     x, t, is_cond, *args_cond, **kwargs_cond
                 )
-                
+
+
+class ClassifierFreeGuidanceWithExternalUnconditionalProbability(ClassifierFreeGuidance):
+
+    def __init__(self, *args, use_unconditional_from_flow_matching=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_unconditional_from_flow_matching = use_unconditional_from_flow_matching
+
+    def forward(self, x, t, *args_cond, p_unconditional=None, **kwargs_cond):
+        # p_unconditional should be a value in [0, 1], indicating the probability of unconditional
+
+        if p_unconditional is None:
+            coin_flip = random.random() < self.p_unconditional
+        else:
+            coin_flip = random.random() < p_unconditional
+
+        # handle case when no conditional arguments are provided
+        if len(args_cond) + len(kwargs_cond) == 0:  # unconditional
+            if self.unconditional_handling != "discard":
+                raise RuntimeError(
+                    f"cannot call `ClassifierFreeGuidance` module without condition"
+                )
+            return self.backbone(x, t)
+        else:  # conditional arguments are provided
+            # training mode
+            if self.training:
+                if coin_flip:  # unconditional
+                    args_cond, kwargs_cond = self._make_unconditional_args(
+                        args_cond,
+                        kwargs_cond,
+                    )
+                return self.backbone(x, t, *args_cond, **kwargs_cond)
+            else:  # inference mode
+                in_interval = (self.interval is None) or (
+                    self.interval[0] <= t <= self.interval[1]
+                )
+                is_cond = not(self.strength > 0.0 and in_interval)
+                return self.inner_forward(
+                    x, t, is_cond, *args_cond, **kwargs_cond
+                )

@@ -7,6 +7,8 @@ if BACKEND == "xformers":
     import xformers.ops as xops
 elif BACKEND == "flash_attn":
     import flash_attn
+elif BACKEND == "torch_flash_attn":
+    pass
 elif BACKEND == "sdpa":
     from torch.nn.functional import scaled_dot_product_attention as sdpa
 elif BACKEND == "naive":
@@ -147,6 +149,20 @@ def scaled_dot_product_attention(*args, **kwargs):
         v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
         out = sdpa(q, k, v)  # [N, H, L, C]
         out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
+    elif BACKEND == "torch_flash_attn":
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=2)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=2)
+        q = q.permute(0, 2, 1, 3)  # [N, H, L, C]
+        k = k.permute(0, 2, 1, 3)  # [N, H, L, C]
+        v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
+        original_dtype = q.dtype
+        with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION]):
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                out = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # [N, H, L, C]
+        out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
+        out = out.to(original_dtype)
     elif BACKEND == "naive":
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=2)
