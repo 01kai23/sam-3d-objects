@@ -34,12 +34,11 @@ class Inference:
     # public facing inference API
     # only put publicly exposed arguments here
     def __init__(self, config_file: str, compile: bool = False):
-
         # load inference pipeline
         config = OmegaConf.load(config_file)
         config.rendering_engine = "pytorch3d"  # overwrite to disable nvdiffrast
         config.compile_model = compile
-        config.workspace_dir = os.path.dirname(__file__)
+        config.workspace_dir = os.path.dirname(config_file)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
 
     def __call__(

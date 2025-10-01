@@ -1,10 +1,11 @@
 from typing import *
 import torch
-import torch.nn as nn
 from . import BACKEND, DEBUG
 
-SparseTensorData = None  # Lazy import
-
+if BACKEND == "torchsparse":
+    from torchsparse import SparseTensor as SparseTensorData
+elif BACKEND == "spconv":
+    from spconv.pytorch import SparseConvTensor as SparseTensorData
 
 __all__ = [
     "SparseTensor",
@@ -51,18 +52,6 @@ class SparseTensor:
     ): ...
 
     def __init__(self, *args, **kwargs):
-        # Lazy import of sparse tensor backend
-        global SparseTensorData
-        if SparseTensorData is None:
-            import importlib
-
-            if BACKEND == "torchsparse":
-                SparseTensorData = importlib.import_module("torchsparse").SparseTensor
-            elif BACKEND == "spconv":
-                SparseTensorData = importlib.import_module(
-                    "spconv.pytorch"
-                ).SparseConvTensor
-
         method_id = 0
         if len(args) != 0:
             method_id = 0 if isinstance(args[0], torch.Tensor) else 1
