@@ -12,7 +12,7 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms import Transform3d, matrix_to_quaternion
 from pytorch3d.io import load_ply
 from loguru import logger
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from sam3d_objects.data.dataset.tdfy.transforms_3d import (
     compose_transform,
@@ -59,9 +59,15 @@ def identity_pose(transforms_path: str, z_at_origin=False) -> dict:
 
     return camera_pose
 
-def dummy_VLMranked_identity_pose(transforms_path: str, z_at_origin=False):
+def dummy_VLMranked_identity_pose(transforms_path: str, view_id, z_at_origin=False):
     return {
         "000.png": identity_pose(transforms_path=transforms_path, z_at_origin=z_at_origin)
+    }
+
+def dummy_arctic_hand_identity_pose(transforms_path: str, view_id, z_at_origin=False):
+    return {
+        f"rgba_{i:03d}.png": identity_pose(transforms_path=transforms_path, z_at_origin=z_at_origin)
+        for i in range(10)
     }
     
 def load_transforms_json(transforms_path: str) -> dict:
@@ -113,7 +119,7 @@ class R3:
         }
 
     @staticmethod
-    def load_pose_general(transforms_path: str) -> dict:
+    def load_pose_general(transforms_path: str, view_id: str = None) -> dict:
         if not os.path.exists(transforms_path):
             logger.opt(exception=False).warning(f"{transforms_path} does not exist.")
             return {}
@@ -125,6 +131,8 @@ class R3:
 
         for frame_data in transforms_data["frames"]:
             file_name = os.path.basename(frame_data["file_path"])  # e.g. "rgba_003.png"
+            if view_id is not None and file_name != view_id:
+                continue
 
             RR = torch.tensor(frame_data["RR"], dtype=torch.float32).unsqueeze(0)
             TT = torch.tensor(frame_data["TT"], dtype=torch.float32).unsqueeze(0)
@@ -230,7 +238,7 @@ class R3:
         return trellis_mesh
 
     @staticmethod
-    def load_pointmap(image_basename: str, pointcloud_directory: str, sha256: str = None, image_fname: str = None) -> torch.Tensor:
+    def load_pointmap(image_basename: str, pointcloud_directory: str, sha256: str = None, image_fname: str = None, file_identifier: str = None) -> torch.Tensor:
         # Try standard format first (for moge)
         standard_dir = os.path.join(pointcloud_directory, image_basename)
         
@@ -238,6 +246,14 @@ class R3:
             # Use standard moge format
             dirname = image_basename
             base_path = standard_dir
+        elif sha256 and file_identifier:
+            file_identifier = file_identifier.split('/')[-1]
+            dirname = f"{image_basename}_{sha256}_{file_identifier}"
+            base_path = os.path.join(pointcloud_directory, dirname)
+            if not os.path.exists(base_path):
+                raise FileNotFoundError(
+                    f"Pointmap directory not found for {image_basename} at {base_path}. "
+                )
         elif sha256 and image_fname:
             # Extract frame number from image filename (e.g., "rgba_003.png" -> "003")
             frame = image_fname.replace("rgba_", "").replace(".png", "") if "rgba_" in image_fname else None
@@ -253,6 +269,7 @@ class R3:
                     f"Tried: {standard_dir} and {base_path}"
                 )
         else:
+            
             raise FileNotFoundError(
                 f"Pointmap directory not found at {standard_dir} and sha256/image_fname not provided for corrected format"
             )
@@ -334,7 +351,7 @@ class R3:
         return ndc_transform.get_matrix()[0, :3, :3].T
 
 
-def load_trellis_pose(transforms_path: str) -> dict:
+def load_trellis_pose(transforms_path: str, view_id: Optional[str] = None) -> dict:
     with open(transforms_path, "r") as file:
         transforms_data = json.load(file)
     frames_data = transforms_data["frames"]
@@ -388,7 +405,7 @@ def load_trellis_pose(transforms_path: str) -> dict:
     return camera_poses
 
 
-def load_trellis_pose_w_scale(transforms_path: str) -> dict:
+def load_trellis_pose_w_scale(transforms_path: str, view_id: Optional[str] = None) -> dict:
     camera_poses = load_trellis_pose(transforms_path)
     with open(transforms_path, "r") as file:
         transforms_data = json.load(file)
@@ -403,7 +420,7 @@ def load_trellis_pose_w_scale(transforms_path: str) -> dict:
 # R3.load_pose = R3._temporary_R3_load_pose_fix
 
 
-def load_pose_objaversev1old(pose_path: str) -> dict:
+def load_pose_objaversev1old(pose_path: str, view_id: Optional[str] = None) -> dict:
     camera_pos = np.load(pose_path)
     R, T = camera_pos[:3, :3], camera_pos[:3, -1]
     R_pytorch3d, T_pytorch3d = blender2pytorch3d(
@@ -431,7 +448,7 @@ def load_pose_objaversev1old(pose_path: str) -> dict:
     return camera_pose
 
 
-def load_objaversev1old_pose(pose_path: str) -> dict:
+def load_objaversev1old_pose(pose_path: str, view_id: Optional[str] = None) -> dict:
     camera_pos = np.load(pose_path)
     R, T = camera_pos[:3, :3], camera_pos[:3, -1]
     R_pytorch3d, T_pytorch3d = blender2pytorch3d(

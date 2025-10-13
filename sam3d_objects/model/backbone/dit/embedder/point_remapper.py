@@ -6,7 +6,7 @@ import torch.nn as nn
 class PointRemapper(nn.Module):
     """Handles remapping of 3D point coordinates and their inverse transformations."""
 
-    VALID_TYPES = ["linear", "sinh", "exp", "sinh_exp"]
+    VALID_TYPES = ["linear", "sinh", "exp", "sinh_exp", "exp_disparity"]
 
     def __init__(self, remap_type: str = "exp"):
         super().__init__()
@@ -30,6 +30,12 @@ class PointRemapper(nn.Module):
             # Use log1p for better numerical stability near zero
             z = torch.log1p(z_exp)
             xy = xy_scaled / (1 + z_exp)
+            return torch.cat([xy, z], dim=-1)
+        
+        elif self.remap_type == "exp_disparity":
+            xy_scaled, z_exp = points.split([2, 1], dim=-1)
+            xy = xy_scaled / z_exp
+            z = torch.log(z_exp)
             return torch.cat([xy, z], dim=-1)
 
         elif self.remap_type == "sinh_exp":
@@ -55,6 +61,11 @@ class PointRemapper(nn.Module):
             z_exp = torch.expm1(z)
             # Inverse of xy/(1+z_exp) is xy*(1+z_exp)
             return torch.cat([xy * (1 + z_exp), z_exp], dim=-1)
+
+        elif self.remap_type == "exp_disparity":
+            xy, z = points.split([2, 1], dim=-1)
+            z_exp = torch.exp(z)
+            return torch.cat([xy * z_exp, z_exp], dim=-1)
 
         elif self.remap_type == "sinh_exp":
             xy, z = points.split([2, 1], dim=-1)

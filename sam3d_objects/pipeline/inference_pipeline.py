@@ -18,7 +18,6 @@ def set_attention_backend():
         os.environ["ATTN_BACKEND"] = "flash_attn"
         os.environ["SPARSE_ATTN_BACKEND"] = "flash_attn"
 
-
 set_attention_backend()
 
 from typing import List, Union
@@ -111,13 +110,9 @@ class InferencePipeline:
             self.decode_formats = decode_formats
             self.pad_size = pad_size
             self.version = version
-            self.ss_preprocessor = ss_preprocessor
-            self.slat_preprocessor = slat_preprocessor
-            self.layout_preprocessor = layout_preprocessor
             self.ss_condition_input_mapping = ss_condition_input_mapping
             self.slat_condition_input_mapping = slat_condition_input_mapping
             self.layout_condition_input_mapping = layout_condition_input_mapping
-            self.pose_decoder = get_pose_decoder(pose_decoder_name)
             self.workspace_dir = workspace_dir
             self.use_pretrained_slat = use_pretrained_slat
             self.force_shape_in_layout = force_shape_in_layout
@@ -137,6 +132,12 @@ class InferencePipeline:
             else:
                 self.layout_model_dtype = self._get_dtype(layout_model_dtype)
 
+            # Setup preprocessors
+            self.pose_decoder = self.init_pose_decoder(ss_generator_config_path, pose_decoder_name)
+            self.ss_preprocessor = self.init_ss_preprocessor(ss_preprocessor, ss_generator_config_path)
+            self.slat_preprocessor = slat_preprocessor
+            self.layout_preprocessor = self.init_ss_preprocessor(layout_preprocessor, layout_model_config_path)
+    
             logger.info("Loading model weights...")
 
             ss_generator = self.init_ss_generator(
@@ -231,6 +232,7 @@ class InferencePipeline:
         torch._dynamo.config.accumulated_cache_size_limit = 2048
         torch._dynamo.config.capture_scalar_outputs = True
         compile_mode = "max-autotune"
+        logger.info(f"Compile mode {compile_mode}")
 
         def clone_output_wrapper(f):
             @wraps(f)
@@ -328,6 +330,18 @@ class InferencePipeline:
         model = model.to(device)
 
         return model
+
+    def init_pose_decoder(self, ss_generator_config_path, pose_decoder_name):
+        if pose_decoder_name is None:
+            pose_decoder_name = OmegaConf.load(os.path.join(self.workspace_dir, ss_generator_config_path))["module"]["pose_target_convention"]
+        logger.info(f"Using pose decoder: {pose_decoder_name}")
+        return get_pose_decoder(pose_decoder_name)
+
+    def init_ss_preprocessor(self, ss_preprocessor, ss_generator_config_path):
+        if ss_preprocessor is not None:
+            return ss_preprocessor
+        config = OmegaConf.load(os.path.join(self.workspace_dir, ss_generator_config_path))["tdfy"]["val_preprocessor"]
+        return instantiate(config)
 
     def init_ss_generator(self, ss_generator_config_path, ss_generator_ckpt_path):
         return self.instantiate_and_load_from_pretrained(
@@ -684,6 +698,7 @@ class InferencePipeline:
             assert mask.shape[:2] == image.shape[:2]
             image = np.concatenate([image[..., :3], mask], axis=-1)
 
+        image = np.array(image)
         return image
 
     def decode_slat(

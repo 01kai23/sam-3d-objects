@@ -1,9 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+from collections import namedtuple
 import random
 from typing import Optional, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
+import torchvision.transforms.functional
+from sam3d_objects.data.dataset.tdfy.img_processing import pad_to_square_centered
+from sam3d_objects.model.backbone.dit.embedder.point_remapper import PointRemapper
+from typing import Optional, Dict
 from loguru import logger
 import torch
 import torch.nn.functional as F
@@ -492,6 +497,240 @@ def resize_all_to_same_size(
     return rgb_image, mask
 
 
+SSINormalizedPointmap = namedtuple("SSINormalizedPointmap", ["pointmap", "scale", "shift"])
+class SSIPointmapNormalizer:
+
+    def normalize(self, pointmap: torch.Tensor, mask: torch.Tensor,
+        scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None,
+    ) -> SSINormalizedPointmap:
+        if scale is None or shift is None:
+            normalized_pointmap, scale, shift = normalize_pointmap_ssi(pointmap)
+        else:
+            assert scale.shape == (3,) and shift.shape == (3,), "scale and shift must be in (3,) format"
+            normalized_pointmap = _apply_metric_to_ssi(pointmap, scale, shift)
+        return SSINormalizedPointmap(normalized_pointmap, scale, shift)
+    
+    def denormalize(self, pointmap: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+        pointmap = _apply_metric_to_ssi(pointmap, scale, shift, apply_inverse=True)
+        return pointmap
+
+
+
+class ObjectCentricSSI(SSIPointmapNormalizer):
+    def __init__(self,
+        use_scene_scale: bool = True,
+        quantile_drop_threshold: float = 0.1,
+        clip_beyond_scale: Optional[float] = None,
+        # scale_factor: float = 3.8076, # e^(1.337); empirical mean of R3+Artist train
+        scale_factor: float = 1.0, # e^(1.337); empirical mean of R3+Artist train
+        allow_scale_and_shift_override: bool = False,
+    ):
+        self.use_scene_scale = use_scene_scale
+        self.quantile_drop_threshold = quantile_drop_threshold
+        self.clip_beyond_scale = clip_beyond_scale
+        self.scale_factor = scale_factor
+        self.allow_scale_and_shift_override = allow_scale_and_shift_override
+
+    def _compute_scale_and_shift(self, pointmap: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pointmap_size = (pointmap.shape[1], pointmap.shape[2])
+
+        
+        mask_resized = torchvision.transforms.functional.resize(
+            mask, pointmap_size,
+            interpolation=torchvision.transforms.InterpolationMode.NEAREST
+        ).squeeze(0)
+
+        pointmap_flat = pointmap.reshape(3, -1)
+        # Get valid points from the mask
+        mask_bool = mask_resized.reshape(-1) > 0.5
+        mask_points = pointmap_flat[:, mask_bool]
+
+
+        # Compute median for shift
+        shift = mask_points.nanmedian(dim=-1).values
+        # logger.info(f"{pointmap.shape=} {mask_resized.shape=} {shift.shape=}")
+
+
+        if self.use_scene_scale == True:
+            # Normalize by the scene scale
+            points_centered = pointmap_flat - shift.unsqueeze(-1)
+            max_dims = points_centered.abs().max(dim=0).values
+            scale = max_dims.nanmedian(dim=-1).values
+        elif self.use_scene_scale == False:
+            # Normalize by the object scale
+            shifted_mask_points = mask_points - shift.unsqueeze(-1)
+            norm = shifted_mask_points.norm(dim=0)
+            quantiles = torch.nanquantile(norm,
+                torch.tensor([self.quantile_drop_threshold, 1. - self.quantile_drop_threshold],
+                device=shifted_mask_points.device),
+                dim=-1)
+            scale = (quantiles[1] - quantiles[0]).max(dim=-1).values * 2.0
+        elif self.use_scene_scale.upper() == "OBJECT_NORM_MEDIAN":
+            # Normalize by the object scale
+            shifted_mask_points = mask_points - shift.unsqueeze(-1)
+            norm = shifted_mask_points.norm(dim=0)
+            scale = norm.nanmedian(dim=-1).values
+        else:
+            raise ValueError(f"Invalid use_scene_scale: {self.use_scene_scale}")
+        scale = scale.expand_as(shift) # per-dim scaling
+        scale = scale * self.scale_factor
+        return scale, shift
+    
+    def normalize(self, pointmap: torch.Tensor, mask: torch.Tensor,
+        scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # 1. resize mask to size of pointmap using nearest interpolation
+        # 2. get mask points: pointmap[mask > 0.5]
+        # 3. shift = mask_points.median() # xyz
+        # 4. scale = # filter. If no points, then
+        # logger.info(f"{pointmap.shape=} {mask.shape=}")
+        assert pointmap.shape[0] == 3, "pointmap must be in (3, H, W) format"
+        pointmap_size = (pointmap.shape[1], pointmap.shape[2])
+
+        _scale, _shift = self._compute_scale_and_shift(pointmap, mask)
+        if scale is not None and self.allow_scale_and_shift_override:
+            _scale = scale
+        if shift is not None and self.allow_scale_and_shift_override:
+            _shift = shift
+        return_scale, return_shift = _scale, _shift
+
+        # Apply normalization
+        pointmap_normalized = _apply_metric_to_ssi(pointmap, return_scale, return_shift)
+        
+        if self.clip_beyond_scale is not None and self.clip_beyond_scale > 0:
+            new_norm = pointmap_normalized.norm(dim=0)
+            pointmap_normalized = torch.where(
+                new_norm > self.clip_beyond_scale,
+                torch.full_like(pointmap_normalized, float('nan')),
+                pointmap_normalized
+            )
+
+        return SSINormalizedPointmap(pointmap_normalized, return_scale, return_shift)
+
+
+class ObjectApparentSizeSSI(SSIPointmapNormalizer):
+    def __init__(self,
+            clip_beyond_scale: Optional[float] = None,
+            use_scene_scale: bool = True, 
+            scale_factor: float = 1.0, # e^(1.337); empirical mean of R3+Artist train
+        ):
+        self.clip_beyond_scale = clip_beyond_scale
+        self.use_scene_scale = use_scene_scale
+        self.scale_factor = scale_factor
+
+    def _get_scale_and_shift(self, pointmap: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pointmap_size = (pointmap.shape[1], pointmap.shape[2])
+        pointmap_flat = pointmap.reshape(3, -1)
+
+        if not self.use_scene_scale:
+            # Get valid points from the mask
+            mask_resized = torchvision.transforms.functional.resize(
+                mask, pointmap_size,
+                interpolation=torchvision.transforms.InterpolationMode.NEAREST
+            ).squeeze(0)
+            mask_bool = mask_resized.reshape(-1) > 0.5
+            pointmap_flat = pointmap_flat[:, mask_bool]
+
+        # Median z-distance
+        median_z = pointmap_flat[-1, ...].nanmedian().unsqueeze(0)
+        scale = median_z.expand(3) * self.scale_factor
+        shift = torch.zeros_like(scale)
+        # logger.info(f'median z = {median_z}')
+        return scale, shift
+
+    def normalize(self,
+        pointmap: torch.Tensor,
+        mask: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert pointmap.shape[0] == 3, "pointmap must be in (3, H, W) format"
+        pointmap_size = (pointmap.shape[1], pointmap.shape[2])
+
+        if scale is None or shift is None:
+            scale, shift = self._get_scale_and_shift(pointmap, mask)
+        else:
+            assert scale.shape == (3,) and shift.shape == (3,), "scale and shift must be in (3,) format"
+
+        # Apply normalization and clip
+        pointmap_normalized = _apply_metric_to_ssi(pointmap, scale, shift)
+        # logger.info(f"{pointmap_normalized.shape=}")
+        
+        if self.clip_beyond_scale is not None and self.clip_beyond_scale > 0:
+            pointmap_normalized = torch.where(
+                pointmap_normalized[-1, ...] > self.clip_beyond_scale,
+                torch.full_like(pointmap_normalized, float('nan')),
+                pointmap_normalized
+            )
+        
+        # return pointmap_normalized, scale, shift
+        return SSINormalizedPointmap(pointmap_normalized, scale, shift)
+
+
+class NormalizedDisparitySpaceSSI(SSIPointmapNormalizer):
+    def __init__(self,
+        clip_beyond_scale: Optional[float] = None,
+        use_scene_scale: bool = True,
+        log_disparity_shift: float = 0.0,
+    ):
+        self.clip_beyond_scale = clip_beyond_scale
+        self.use_scene_scale = use_scene_scale
+        self.point_remapper = PointRemapper(remap_type="exp_disparity")
+        self.log_disparity_shift = log_disparity_shift
+
+    def normalize(self, pointmap: torch.Tensor, mask: torch.Tensor,
+        scale: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        assert pointmap.shape[0] == 3, "pointmap must be in (3, H, W) format"
+
+
+        disparity_space_pointmap = self.point_remapper.forward(pointmap.permute(1, 2, 0)).permute(2, 0, 1)
+        if scale is None or shift is None:
+            scale, shift = self._get_scale_and_shift(disparity_space_pointmap, mask)
+        else:
+            assert scale.shape == (3,) and shift.shape == (3,), "scale and shift must be in (3,) format"
+
+        # pointmap_normalized = pointmap.clone().detach()
+        pointmap_normalized = _apply_metric_to_ssi(disparity_space_pointmap, scale, shift)
+        # logger.info(f"{pointmap_normalized.shape=}")
+        
+        if self.clip_beyond_scale is not None and self.clip_beyond_scale > 0:
+            pointmap_normalized = torch.where(
+                pointmap_normalized[2, ...].abs() > self.clip_beyond_scale,
+                torch.full_like(pointmap_normalized, float('nan')),
+                pointmap_normalized
+            )
+        
+        # return pointmap_normalized, scale, shift
+        return SSINormalizedPointmap(pointmap_normalized, scale, shift)
+    
+    def denormalize(self, pointmap: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+        pointmap = _apply_metric_to_ssi(pointmap, scale, shift, apply_inverse=True)
+        pointmap = self.point_remapper.inverse(pointmap.permute(1, 2, 0)).permute(2, 0, 1)
+        return pointmap
+
+    def _get_scale_and_shift(self, pointmap: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pointmap_size = (pointmap.shape[1], pointmap.shape[2])
+        mask_resized = torchvision.transforms.functional.resize(
+            mask, pointmap_size,
+            interpolation=torchvision.transforms.InterpolationMode.NEAREST
+        ).squeeze(0)
+
+        pointmap_flat = pointmap.reshape(3, -1)
+        if self.use_scene_scale:
+            median_z = pointmap_flat[-1, ...].nanmedian().unsqueeze(0)
+            shift = torch.zeros_like(median_z.expand(3))
+            shift[-1, ...] = median_z[0] + self.log_disparity_shift
+        else:
+            # Get valid points from the mask (shift, x/z, y/z, log(z))
+            mask_bool = mask_resized.reshape(-1) > 0.5
+            pointmap_flat = pointmap_flat[:, mask_bool]
+            shift = pointmap_flat.nanmedian(dim=-1).values
+
+        scale = torch.ones_like(shift)
+        # logger.info(f'median z = {median_z}')
+        return scale, shift
+
 def normalize_pointmap_ssi(pointmap: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Normalize pointmap using Scale-Shift Invariant (SSI) normalization.
@@ -515,10 +754,39 @@ def normalize_pointmap_ssi(pointmap: torch.Tensor) -> tuple[torch.Tensor, torch.
     # Get scale and shift using existing method
     scale, shift = ScaleShiftInvariant.get_scale_and_shift(pointmap_hw3)
     
+    pointmap_normalized = _apply_metric_to_ssi(pointmap, scale, shift)
+    return pointmap_normalized, scale, shift
+
+def _apply_metric_to_ssi(pointmap: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, apply_inverse: bool = False) -> torch.Tensor:
+    """
+    Normalize pointmap using Scale-Shift Invariant (SSI) normalization.
+    
+    Args:
+        pointmap: Pointmap tensor of shape (H, W, 3) or (3, H, W)
+        
+    Returns:
+        Tuple of (normalized_pointmap, scale, shift)
+    """
+    from sam3d_objects.data.dataset.tdfy.pose_target import ScaleShiftInvariant
+    
+    # Convert to (H, W, 3) if needed for get_scale_and_shift
+    if pointmap.shape[0] == 3:
+        pointmap_hw3 = pointmap.permute(1, 2, 0)
+        original_format = 'chw'
+    else:
+        pointmap_hw3 = pointmap
+        original_format = 'hwc'
+    
     # Apply normalization
-    metric_to_ssi = ScaleShiftInvariant.ssi_to_metric(scale, shift).inverse()
+    ssi_to_metric = ScaleShiftInvariant.ssi_to_metric(scale, shift)
+    metric_to_ssi = ssi_to_metric.inverse()
+    transform_to_apply = metric_to_ssi
+
+    if apply_inverse:
+        transform_to_apply = ssi_to_metric
+
     pointmap_flat = pointmap_hw3.reshape(-1, 3)
-    pointmap_normalized = metric_to_ssi.transform_points(pointmap_flat)
+    pointmap_normalized = transform_to_apply.transform_points(pointmap_flat)
     
     # Reshape back to original format
     if original_format == 'chw':
@@ -526,7 +794,7 @@ def normalize_pointmap_ssi(pointmap: torch.Tensor) -> tuple[torch.Tensor, torch.
     else:
         pointmap_normalized = pointmap_normalized.reshape(pointmap_hw3.shape)
     
-    return pointmap_normalized, scale, shift
+    return pointmap_normalized
 
 
 def perturb_mask_translation(

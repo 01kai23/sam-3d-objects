@@ -199,29 +199,34 @@ class InvariantPoseTarget:
             if self.__dict__[field] is None:
                 raise ValueError(f"Field '{field}' must be provided.")
 
+
     @staticmethod
-    def from_instance_pose(
-        instance_pose: InstancePose,
-    ) -> "InvariantPoseTarget":
-        instance_quaternion_l2c = instance_pose.instance_quaternion_l2c
-        s_obj_to_scene = instance_pose.instance_scale_l2c
-        t_obj_to_scene = instance_pose.instance_position_l2c
-        s_scene = instance_pose.scene_scale
-        t_scene_center = instance_pose.scene_shift
+    def from_instance_pose(instance_pose: InstancePose) -> "InvariantPoseTarget":
+        q = instance_pose.instance_quaternion_l2c
+        s_obj_to_scene = instance_pose.instance_scale_l2c      # (..., 1) or (..., 3)
+        t_obj_to_scene = instance_pose.instance_position_l2c   # (..., 3)
+        s_scene = instance_pose.scene_scale                    # (..., 1) or scalar-broadcastable
+        t_scene_center = instance_pose.scene_shift             # (..., 3)
 
-        scale = t_scene_center.norm(dim=-1, keepdim=True)
+        # Normalize to scene scale (per the derivation)
+        if not ( s_obj_to_scene.ndim == (s_scene.ndim + 1)):
+            raise ValueError(f"s_scene should be ND [...,3] and s_obj_to_scene should be (N+1)D [...,K,3], but got {s_scene.shape=} {s_obj_to_scene.shape=}")
+        if not (t_obj_to_scene.ndim == (s_scene.ndim + 1)):
+            raise ValueError(f"t_scene_center should be ND [B,3] and t_obj_to_scene should be (N+1)D [B,K,3], but got {t_scene_center.shape=} {t_obj_to_scene.shape=}")
+        s_scene_exp = s_scene.unsqueeze(-2)
 
-        # Normalize everything to scene scale
-        s_rel = s_obj_to_scene / expand_as_right(scale, s_obj_to_scene)
-        t_rel = t_obj_to_scene / expand_as_right(scale, t_obj_to_scene)
-        t_rel_norm = t_rel.norm(dim=-1, keepdim=True)
+        s_rel = s_obj_to_scene / s_scene_exp
+        t_rel = t_obj_to_scene / s_scene_exp
 
-        # Quantities that are decoupled from scene scale
+        # Robust norms
+        eps = 1e-8
+        t_rel_norm = t_rel.norm(dim=-1, keepdim=True).clamp_min(eps)
+
         s_tilde = s_rel / t_rel_norm
         t_unit = t_rel / t_rel_norm
 
         return InvariantPoseTarget(
-            q=instance_quaternion_l2c,
+            q=q,
             s_scene=s_scene,
             t_scene_center=t_scene_center,
             s_rel=s_rel,
@@ -230,14 +235,16 @@ class InvariantPoseTarget:
             t_rel_norm=t_rel_norm,
         )
 
+
     @staticmethod
-    def to_instance_pose(
-        invariant_targets: "InvariantPoseTarget",
-    ) -> InstancePose:
-        scale = (
-            invariant_targets.t_scene_center.norm(dim=-1, keepdim=True)
-            * invariant_targets.t_rel_norm
-        )
+    def to_instance_pose(invariant_targets: "InvariantPoseTarget") -> InstancePose:
+        # scale factor per the derivation: s_scene * |t_rel|
+        # Normalize to scene scale (per the derivation)
+        t_rel_norm_ndim = invariant_targets.t_rel_norm.ndim
+        if not (invariant_targets.s_scene.ndim == (t_rel_norm_ndim - 1)) :
+            raise ValueError(f"s_scene should be ND [...,3] and t_rel_norm should be (N+1)D [...,K,3], but got {invariant_targets.s_scene.shape=} {invariant_targets.t_rel_norm.shape=}")
+
+        scale = invariant_targets.s_scene.unsqueeze(-2) * invariant_targets.t_rel_norm
         return InstancePose(
             instance_scale_l2c=invariant_targets.s_tilde * scale,
             instance_position_l2c=invariant_targets.t_unit * scale,
@@ -298,6 +305,7 @@ class ScaleShiftInvariant(PoseTargetConvention):
             translation=instance_pose.instance_position_l2c,
             transform_to_postcompose=metric_to_ssi,
         )
+        # logger.info(f"{normalize=} {ssi_scale.shape=} {ssi_rotation.shape=} {ssi_translation.shape=}")
         if normalize:
             device = ssi_scale.device
             ssi_scale = (ssi_scale - cls.scale_mean.to(device)) / cls.scale_std.to(device)
@@ -360,6 +368,7 @@ class ScaleShiftInvariant(PoseTargetConvention):
 
         shift = shift.reshape(3)
         scale = scale.expand(3)
+
         return scale, shift
 
     @staticmethod
@@ -369,6 +378,183 @@ class ScaleShiftInvariant(PoseTargetConvention):
         if shift.ndim == 1:
             shift = shift.unsqueeze(0)
         return Transform3d().scale(scale).translate(shift).to(shift.device)
+
+
+class ScaleShiftInvariantWTranslationScale(PoseTargetConvention):
+    """
+
+    Midas eq. (6): https://arxiv.org/pdf/1907.01341v3
+    But for pointmaps (see MoGe): https://arxiv.org/pdf/2410.19115
+    """
+
+    pose_target_convention: str = "ScaleShiftInvariantWTranslationScale"
+    scale_mean = torch.tensor([1.0232692956924438, 1.0232691764831543, 1.0232692956924438]).to(torch.float32)
+    scale_std = torch.tensor([1.3773751258850098, 1.3773752450942993, 1.3773750066757202]).to(torch.float32)
+    translation_mean = torch.tensor([0.003191213821992278, 0.017236359417438507, 0.9401122331619263]).to(torch.float32)
+    translation_std = torch.tensor([1.341888666152954, 0.7665449380874634, 3.175130605697632]).to(torch.float32)
+
+    @classmethod
+    def from_instance_pose(cls, instance_pose: InstancePose, normalize: bool = False) -> PoseTarget:
+        metric_to_ssi = cls.ssi_to_metric(
+            instance_pose.scene_scale, instance_pose.scene_shift
+        ).inverse()
+
+        ssi_scale, ssi_rotation, ssi_translation = InstancePose._broadcast_postcompose(
+            scale=instance_pose.instance_scale_l2c,
+            rotation=instance_pose.instance_quaternion_l2c,
+            translation=instance_pose.instance_position_l2c,
+            transform_to_postcompose=metric_to_ssi,
+        )
+
+        ssi_translation_scale = ssi_translation.norm(dim=-1, keepdim=True)
+        ssi_translation_unit = ssi_translation / ssi_translation_scale.clamp_min(1e-7)
+
+        return PoseTarget(
+            x_instance_scale=ssi_scale,
+            x_instance_rotation=ssi_rotation,
+            x_instance_translation=ssi_translation_unit,
+            x_scene_scale=instance_pose.scene_scale,
+            x_scene_center=instance_pose.scene_shift,
+            x_translation_scale=ssi_translation_scale,
+            pose_target_convention=cls.pose_target_convention,
+        )
+
+    @classmethod
+    def to_instance_pose(cls, pose_target: PoseTarget, normalize: bool = False) -> InstancePose:
+        scene_scale = pose_target.x_scene_scale
+        scene_shift = pose_target.x_scene_center
+        ssi_to_metric = cls.ssi_to_metric(scene_scale, scene_shift)
+
+        ins_translation_unit = pose_target.x_instance_translation / pose_target.x_instance_translation.norm(dim=-1, keepdim=True)
+        ins_translation = ins_translation_unit * pose_target.x_translation_scale
+
+
+        ins_scale, ins_rotation, ins_translation = InstancePose._broadcast_postcompose(
+            scale=pose_target.x_instance_scale,
+            rotation=pose_target.x_instance_rotation,
+            translation=ins_translation,
+            transform_to_postcompose=ssi_to_metric,
+        )
+
+
+        return InstancePose(
+            instance_scale_l2c=ins_scale,
+            instance_position_l2c=ins_translation,
+            instance_quaternion_l2c=ins_rotation,
+            scene_scale=scene_scale,
+            scene_shift=scene_shift,
+        )
+
+    @classmethod
+    def to_invariant(cls, pose_target: PoseTarget) -> InvariantPoseTarget:
+        instance_pose = cls.to_instance_pose(pose_target)
+        return InvariantPoseTarget.from_instance_pose(instance_pose)
+
+    @classmethod
+    def from_invariant(cls, invariant_targets: InvariantPoseTarget) -> PoseTarget:
+        instance_pose = InvariantPoseTarget.to_instance_pose(invariant_targets)
+        return cls.from_instance_pose(instance_pose)
+
+    @classmethod
+    def get_scale_and_shift(cls, pointmap):
+        shift_z = pointmap[..., -1].nanmedian().unsqueeze(0)
+        shift = torch.zeros_like(shift_z.expand(1, 3))
+        shift[..., -1] = shift_z
+
+        shifted_pointmap = pointmap - shift
+        scale = shifted_pointmap.abs().nanmean().to(shift.device)
+
+        shift = shift.reshape(3)
+        scale = scale.expand(3)
+
+        return scale, shift
+
+    @staticmethod
+    def ssi_to_metric(scale: torch.Tensor, shift: torch.Tensor):
+        if scale.ndim == 1:
+            scale = scale.unsqueeze(0)
+        if shift.ndim == 1:
+            shift = shift.unsqueeze(0)
+        return Transform3d().scale(scale).translate(shift).to(shift.device)
+
+
+class DisparitySpace(PoseTargetConvention):
+    pose_target_convention: str = "DisparitySpace"
+    
+    @classmethod
+    def from_instance_pose(cls, instance_pose: InstancePose, normalize: bool = False) -> PoseTarget:
+ 
+        # x_instance_scale = orig_scale / scene_scale
+        # x_instance_translation = [x/z, y/z, 0]  / scene_scale
+        # x_translation_scale = z  / scene_scale
+        assert torch.allclose(instance_pose.scene_scale, torch.ones_like(instance_pose.scene_scale))
+
+        if not instance_pose.scene_shift.ndim == instance_pose.instance_position_l2c.ndim - 1:
+            raise ValueError(f"scene_shift must be (N+1)D and instance_position_l2c must be (N+1)D, but got {instance_pose.scene_shift.ndim} and {instance_pose.instance_position_l2c.ndim}")
+        shift_xy, shift_z_log = instance_pose.scene_shift.unsqueeze(-2).split([2, 1], dim=-1)
+
+
+        pose_xy, pose_z = instance_pose.instance_position_l2c.split([2, 1], dim=-1)
+        # Handle batch dimensions properly
+        if shift_xy.ndim < pose_xy.ndim:
+            shift_xy = shift_xy.unsqueeze(-2)
+        pose_xy_scaled = pose_xy / pose_z - shift_xy
+
+        pose_z_scaled_log = torch.log(pose_z) - shift_z_log
+        x_instance_scale_log = torch.log(instance_pose.instance_scale_l2c) - torch.log(pose_z)
+
+        x_instance_translation = torch.cat([pose_xy_scaled, torch.zeros_like(pose_z)], dim=-1)
+        x_translation_scale = torch.exp(pose_z_scaled_log)
+        x_instance_scale = torch.exp(x_instance_scale_log)
+
+
+
+        return PoseTarget(
+            x_instance_scale=x_instance_scale,
+            x_instance_translation=x_instance_translation,
+            x_instance_rotation=instance_pose.instance_quaternion_l2c,
+            x_scene_scale=instance_pose.scene_scale,
+            x_scene_center=instance_pose.scene_shift,
+            x_translation_scale=x_translation_scale,
+            pose_target_convention=cls.pose_target_convention,
+        )
+
+    @classmethod
+    def to_instance_pose(cls, pose_target: PoseTarget, normalize: bool = False) -> InstancePose:
+        scene_scale = pose_target.x_scene_scale
+        scene_shift = pose_target.x_scene_center
+
+        if not pose_target.x_scene_center.ndim == pose_target.x_instance_translation.ndim - 1:
+            raise ValueError(f"x_scene_center must be (N+1)D and x_instance_translation must be (N+1)D, but got {pose_target.x_scene_center.ndim} and {pose_target.x_instance_translation.ndim}")
+        shift_xy, shift_z_log = pose_target.x_scene_center.unsqueeze(-2).split([2, 1], dim=-1)
+        scene_z_scale = torch.exp(shift_z_log)
+ 
+        z = pose_target.x_translation_scale
+        ins_translation = pose_target.x_instance_translation.clone()
+        ins_translation[...,2] = 1.0
+        ins_translation[...,:2] = ins_translation[...,:2] + shift_xy
+        ins_translation = ins_translation * z * scene_z_scale
+
+        ins_scale = pose_target.x_instance_scale * z * scene_z_scale
+
+        return InstancePose(
+            instance_scale_l2c=ins_scale * scene_scale,
+            instance_position_l2c=ins_translation * scene_scale,
+            instance_quaternion_l2c=pose_target.x_instance_rotation,
+            scene_scale=scene_scale,
+            scene_shift=scene_shift,
+        )
+
+    @classmethod
+    def to_invariant(cls, pose_target: PoseTarget, normalize: bool = False) -> InvariantPoseTarget:
+        instance_pose = cls.to_instance_pose(pose_target, normalize=normalize)
+        return InvariantPoseTarget.from_instance_pose(instance_pose)
+
+    @classmethod
+    def from_invariant(cls, invariant_targets: InvariantPoseTarget, normalize: bool = False) -> PoseTarget:
+        instance_pose = InvariantPoseTarget.to_instance_pose(invariant_targets)
+        return cls.from_instance_pose(instance_pose, normalize=normalize)
+
 
 
 class NormalizedSceneScale(PoseTargetConvention):
@@ -584,3 +770,15 @@ class PoseTargetConverter:
         pose_target = PoseTarget(**kwargs)
         instance_pose = PoseTargetConverter.pose_target_to_instance_pose(pose_target, normalize)
         return asdict(instance_pose)
+
+
+class LogScaleShiftNormalizer:
+    def __init__(self, shift_log: torch.Tensor = 0.0, scale_log: torch.Tensor = 1.0):
+        self.shift_log = shift_log
+        self.scale_log = scale_log
+
+    def normalize(self, value: torch.Tensor):
+        return torch.log(value) - self.shift_log / self.scale_log
+
+    def denormalize(self, value: torch.Tensor):
+        return torch.exp(value * self.scale_log + self.shift_log)

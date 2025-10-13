@@ -19,10 +19,6 @@ from ..renderers import GaussianRenderer
 from ..representations import Strivec, Gaussian, MeshExtractResult
 from loguru import logger
 
-# from sam3d_objects.utils.imp import disable_modules
-
-# disable_modules("nvdiffrast")
-
 @torch.no_grad()
 def _fill_holes(
     verts,

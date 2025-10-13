@@ -12,11 +12,15 @@ from PIL import Image
 from loguru import logger
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
+import warnings
+
 from ..metadata_filter import custom_metadata_filter
 from ..img_and_mask_transforms import (
     get_mask,
     load_rgb,
     normalize_pointmap_ssi,
+    SSINormalizedPointmap,
+    SSIPointmapNormalizer,
 )
 
 from sam3d_objects.utils.decorators.counter import garbage_collect
@@ -60,19 +64,49 @@ class PreProcessor:
     
     # Pointmap normalization option
     normalize_pointmap: bool = False
+    pointmap_normalizer: Optional[Callable] = None
+    rgb_pointmap_normalizer: Optional[Callable] = None
+
+    def __post_init__(self):
+        if self.pointmap_normalizer is None:
+            self.pointmap_normalizer = SSIPointmapNormalizer()
+            if self.normalize_pointmap == False:
+                warnings.warn("normalize_pointmap is also set to False, which means we will return the moments but not normalize the pointmap. This supports old unnormalized pointmap models, but this is dangerous behavior.", DeprecationWarning, stacklevel=2)
+
+        if self.rgb_pointmap_normalizer is None:
+            logger.warning("No rgb pointmap normalizer provided, using scale + shift ")
+            self.rgb_pointmap_normalizer = self.pointmap_normalizer
+
+
+    def _normalize_pointmap(
+        self, pointmap: torch.Tensor,
+        mask: torch.Tensor,
+        pointmap_normalizer: Callable,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
+    ):
+        if pointmap is None:
+            return pointmap, None, None
+
+        if self.normalize_pointmap == False:
+            # old behavior: Pose is normalized to the pointmap center, but pointmap is not
+            _, pointmap_scale, pointmap_shift = pointmap_normalizer.normalize(pointmap, mask)
+            return pointmap, pointmap_scale, pointmap_shift
+        
+        if scale is not None or shift is not None:
+            return pointmap_normalizer.normalize(pointmap, mask, scale, shift)
+            
+        return pointmap_normalizer.normalize(pointmap, mask)
 
     def _process_image_mask_pointmap_mess(
         self, rgb_image, rgb_image_mask, pointmap=None
     ):
         """Extended version that handles pointmaps"""
-        
  
-        # TODO(Sasha): fix this it's so ugly.
         # Apply pointmap normalization if enabled
-        pointmap_scale = None
-        pointmap_shift = None
-        if pointmap is not None and self.normalize_pointmap:
-            pointmap, pointmap_scale, pointmap_shift = normalize_pointmap_ssi(pointmap)
+        pointmap_for_crop, pointmap_scale, pointmap_shift = self._normalize_pointmap(
+            pointmap, rgb_image_mask, self.pointmap_normalizer
+        )
 
         # Apply transforms to the original full rgb image and mask.
         rgb_image, rgb_image_mask = self._preprocess_rgb_image_mask(rgb_image, rgb_image_mask)
@@ -80,7 +114,7 @@ class PreProcessor:
         # These two are typically used for getting cropped images of the object
         #   : first apply joint transforms
         processed_rgb_image, processed_mask, processed_pointmap = (
-            self._preprocess_image_mask_pointmap(rgb_image, rgb_image_mask, pointmap)
+            self._preprocess_image_mask_pointmap(rgb_image, rgb_image_mask, pointmap_for_crop)
         )
         #   : then apply individual transforms on top of the joint transforms
         processed_rgb_image = self._apply_transform(
@@ -96,9 +130,13 @@ class PreProcessor:
         #   : apply individual transforms only
         rgb_image = self._apply_transform(rgb_image, self.img_transform)
         rgb_image_mask = self._apply_transform(rgb_image_mask, self.mask_transform)
-        full_pointmap = None
-        if pointmap is not None:
-            full_pointmap = self._apply_transform(pointmap, self.pointmap_transform)
+        
+        rgb_pointmap, rgb_pointmap_scale, rgb_pointmap_shift = self._normalize_pointmap(
+            pointmap, rgb_image_mask, self.rgb_pointmap_normalizer, pointmap_scale, pointmap_shift
+        )
+
+        if rgb_pointmap is not None:
+            rgb_pointmap = self._apply_transform(rgb_pointmap, self.pointmap_transform)
 
         result = {
             "mask": processed_mask,
@@ -112,7 +150,7 @@ class PreProcessor:
             result.update(
                 {
                     "pointmap": processed_pointmap,
-                    "rgb_pointmap": full_pointmap,
+                    "rgb_pointmap": rgb_pointmap,
                 }
             )
             
@@ -122,6 +160,8 @@ class PreProcessor:
                 {
                     "pointmap_scale": pointmap_scale,
                     "pointmap_shift": pointmap_shift,
+                    "rgb_pointmap_scale": rgb_pointmap_scale,
+                    "rgb_pointmap_shift": rgb_pointmap_shift,
                 }
             )
 
@@ -219,6 +259,7 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         # In the meantime, we exclude them from the dict
         return_pointmap: bool = False,
         return_mesh: bool = False,
+        load_pointmap_render_paste: bool = False,
     ):
         self.path = path
         self.split = split
@@ -243,6 +284,7 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         # set mesh_loader
         self.mesh_loader = mesh_loader
         self.pointmap_loader = pointmap_loader
+        self.load_pointmap_render_paste = load_pointmap_render_paste
 
         self.return_pointmap = return_pointmap
         self.return_mesh = return_mesh
@@ -283,11 +325,13 @@ class PerSubsetDataset(torch.utils.data.Dataset):
 
     def _load_pointmap(self, sha256: str, rgb_image: torch.Tensor, image_fname: str):
         if self.pointmap_loader is None:
+            return None
             return self._dummy_pointmap_moments()
 
         # Subset-specific loading
         # TODO: remove this paragraph
         row = self.metadata[self.metadata["sha256"] == sha256]
+
         if "image_basename" in self.metadata.columns:  # For R3
             image_basename = str(row.image_basename.item())
         else:  # For elephant in the room
@@ -302,11 +346,18 @@ class PerSubsetDataset(torch.utils.data.Dataset):
                     image_metadata_df["local_basename"] == image_basename_no_ext
                 ].image_basename.item()
             )
+        
 
-        # Load pointmap (will auto-detect moge vs moge_corrected format)
-        pointmap = self.pointmap_loader(image_basename, sha256=sha256, image_fname=image_fname)
-        return_dict = PerSubsetDataset._prepare_pointmap(pointmap, self.return_pointmap)
-        return return_dict
+        if self.load_pointmap_render_paste:
+            file_identifier = row.file_identifier.item()
+            pointmap = self.pointmap_loader(image_basename, sha256=sha256, file_identifier=file_identifier)
+        else:
+            # Load pointmap (will auto-detect moge vs moge_corrected format)
+            pointmap = self.pointmap_loader(image_basename, sha256=sha256, image_fname=image_fname)
+        if not torch.isfinite(pointmap).any():
+            raise ValueError("Pointmap detected to be all nans")
+        pointmap = pointmap.permute(2, 0, 1)
+        return pointmap
 
     def _dummy_pointmap_moments(self):
         return {
@@ -315,14 +366,15 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         }
 
     @staticmethod
-    def _get_pointmap_scale_and_shift(pointmap: torch.Tensor):
+    def _get_pointmap_scale_and_shift(pointmap: torch.Tensor, mask: torch.Tensor):
         assert pointmap.shape[-1] == 3, "Pointmap must be 3D"
+        
         return ScaleShiftInvariant.get_scale_and_shift(pointmap)
 
     @staticmethod
-    def _prepare_pointmap(pointmap: torch.Tensor, return_pointmap: bool):
+    def _prepare_pointmap(pointmap: torch.Tensor, return_pointmap: bool, mask: torch.Tensor):
         pointmap_scale, pointmap_shift = PerSubsetDataset._get_pointmap_scale_and_shift(
-            pointmap
+            pointmap, mask
         )
         if torch.isnan(pointmap_scale).any() or torch.isnan(pointmap_shift).any():
             logger.warning(
@@ -355,8 +407,14 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         colors_tensor = torch.from_numpy(np.array(colors_tensor)).float() / 255.0
         return colors_tensor
 
+    def _load_available_poses(self, uid, view_id=None):
+        pose_dir = os.path.join(self.path, "renders_cond", uid)
+        transforms_path = os.path.join(pose_dir, "transforms.json")
+        available_poses = self.pose_loader(transforms_path, view_id)
+        return available_poses
+
     def _load_pose(self, sha256: str, view_id: str):
-        available_poses = self._load_available_poses(sha256)
+        available_poses = self._load_available_poses(sha256, view_id)
         sampled_pose = available_poses[view_id]
         self._validate_pose(sha256, view_id, sampled_pose)
         return sampled_pose
@@ -368,12 +426,6 @@ class PerSubsetDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     f"Object position is centered at camera for sha256: {sha256} and view_id: {view_id}"
                 )
-
-    def _load_available_poses(self, uid):
-        pose_dir = os.path.join(self.path, "renders_cond", uid)
-        transforms_path = os.path.join(pose_dir, "transforms.json")
-        available_poses = self.pose_loader(transforms_path)
-        return available_poses
 
     def _load_mesh_to_latent_transform(self, sha256: str):
         render_dir = os.path.join(self.path, "renders", sha256)
@@ -409,10 +461,11 @@ class PerSubsetDataset(torch.utils.data.Dataset):
     def _load_available_images(self, uid):
         try:
             image_dir = self._get_cond_image_dir(uid)
+            # Use scandir instead of listdir so we don't need to read each file twice
             available_views = [
-                f
-                for f in os.listdir(image_dir)
-                if f.endswith(".png") and os.path.isfile(os.path.join(image_dir, f))
+                entry.name
+                for entry in os.scandir(image_dir)
+                if entry.is_file(follow_symlinks=True) and entry.name.endswith(".png")
             ]
             # TODO: weiyaowang clean this up once we standardize our data format
             if len(available_views) == 0:
@@ -492,12 +545,15 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         rgb_image_mask = self._read_mask(rgba_image)
 
         # This must use the raw image!!! Before cropping and padding
-        pointmap_dict = self._load_pointmap(uid, rgb_image, image_fname)
-        pointmap = pointmap_dict.pop("pointmap", None)
+        raw_pointmap = self._load_pointmap(uid, rgb_image, image_fname)
+
+        # # Not all processors 
+        # pointmap_dict = PerSubsetDataset._prepare_pointmap(raw_pointmap, self.return_pointmap, rgb_image_mask)
+        # pointmap = pointmap_dict.pop("pointmap", None)
 
         # How the images are processed (into crops, padded, etc)
         image_dict = self.preprocessor._process_image_mask_pointmap_mess(
-            rgb_image, rgb_image_mask, pointmap
+            rgb_image, rgb_image_mask, raw_pointmap
         )
 
         sampled_pose = self._load_pose(uid, image_fname)
@@ -510,10 +566,8 @@ class PerSubsetDataset(torch.utils.data.Dataset):
         item.update(image_dict)
         item.update(sampled_pose)
         item.update(mesh_dict)
-        item.update(pointmap_dict)
         item.update(voxel_dict)
         return img_path, item
-
 
 # This is deprecated; leaving here for backward compatibility
 class TrellisDataset(torch.utils.data.Dataset):

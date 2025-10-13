@@ -16,6 +16,11 @@ import math
 import utils3d
 import shutil
 import subprocess
+import seaborn as sns
+from PIL import Image
+import numpy as np
+import gradio as gr
+import matplotlib.pyplot as plt
 from copy import deepcopy
 from kaolin.visualize import IpyTurntableVisualizer
 from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
@@ -43,8 +48,6 @@ BLACKLIST_FILTERS = [
         builtins.exec,
         builtins.eval,
         builtins.__import__,
-        builtins.exit,
-        builtins.quit,
         os.kill,
         os.system,
         os.putenv,
@@ -181,7 +184,7 @@ def render_video_ring(
         sample,
         extrinsics,
         intrinsics,
-        {"resolution": resolution, "bg_color": bg_color},
+        {"resolution": resolution, "bg_color": bg_color, "backend": "gsplat"},
         **kwargs,
     )
 
@@ -209,14 +212,15 @@ def render_video_flat(
         sample,
         extr,
         intr,
-        {"resolution": resolution, "bg_color": bg_color},
+        {"resolution": resolution, "bg_color": bg_color, "backend": "gsplat"},
         **kwargs,
     )
 
 
-def ready_gaussian_for_video_rendering(scene_gs, in_place=False):
-    scene_gs = _fix_gaussian_alignment(scene_gs, in_place=in_place)
-    scene_gs = normalized_gaussian(scene_gs, in_place=True)
+def ready_gaussian_for_video_rendering(scene_gs, in_place=False, fix_alignment=False):
+    if fix_alignment:
+        scene_gs = _fix_gaussian_alignment(scene_gs, in_place=in_place)
+    scene_gs = normalized_gaussian(scene_gs, in_place=fix_alignment)
     return scene_gs
 
 
@@ -228,7 +232,15 @@ def _fix_gaussian_alignment(scene_gs, in_place=False):
     dtype = scene_gs._xyz.dtype
     scene_gs._xyz = (
         scene_gs._xyz
-        @ torch.tensor([[-1, 0, 0], [0, 0, 1], [0, 1, 0]], device=device, dtype=dtype).T
+        @ torch.tensor(
+            [
+                [-1, 0, 0],
+                [0, 0, 1],
+                [0, 1, 0],
+            ],
+            device=device,
+            dtype=dtype,
+        ).T
     )
     return scene_gs
 
@@ -248,73 +260,36 @@ def normalized_gaussian(scene_gs, in_place=False):
     return scene_gs
 
 
-# gaussian visualizer
+def make_scene(*outputs, in_place=False):
+    if not in_place:
+        outputs = [deepcopy(output) for output in outputs]
 
-
-def _make_render_fn(scene_gs):
-    def _gaussian_renderer(camera: Camera):
-        # convert kaolin camera extrinsics & instrinsics
-        # to format undertstood by `render_gaussian_color_stay_in_device`
-        # REMARK(Pierre) This is the wrong conversion, but works in the sense it displays something
-        extr = camera.extrinsics.view_matrix()
-        extr[:, 1, 1] *= -1
-        extr[:, 2, 2] *= -1
-        extr[:, 2, 3] *= -1
-        intr = torch.tensor(
-            [
-                [
-                    [0.8660, 0.0000, 0.5000],
-                    [0.0000, 0.8660, 0.5000],
-                    [0.0000, 0.0000, 1.0000],
-                ]
-            ],
-            device=camera.device,
+    all_outs = []
+    for output in outputs:
+        # move gaussians to scene frame of reference
+        PC = SceneVisualizer.object_pointcloud(
+            points_local=(output["gaussian"][0]._xyz - 0.5).unsqueeze(0),
+            quat_l2c=output["rotation"],
+            trans_l2c=output["translation"],
+            scale_l2c=output["scale"],
         )
+        output["gaussian"][0]._xyz = PC.points_list()[0]
+        output["gaussian"][0]._scaling *= output["scale"]
+        all_outs.append(output)
 
-        color = render_utils.render_gaussian_color_stay_in_device(
-            scene_gs, extr, intr, verbose=False
-        )["color"][0]
-        return color
+    # merge gaussians
+    scene_gs = all_outs[0]["gaussian"][0]
+    for out in all_outs[1:]:
+        out_gs = out["gaussian"][0]
+        scene_gs._xyz = torch.cat([scene_gs._xyz, out_gs._xyz], dim=0)
+        scene_gs._features_dc = torch.cat(
+            [scene_gs._features_dc, out_gs._features_dc], dim=0
+        )
+        scene_gs._scaling = torch.cat([scene_gs._scaling, out_gs._scaling], dim=0)
+        scene_gs._rotation = torch.cat([scene_gs._rotation, out_gs._rotation], dim=0)
+        scene_gs._opacity = torch.cat([scene_gs._opacity, out_gs._opacity], dim=0)
 
-    return _gaussian_renderer
-
-
-def _make_lowres_cam(in_cam, factor=8):
-    lowres_cam = deepcopy(in_cam)
-    lowres_cam.width = in_cam.width // factor
-    lowres_cam.height = in_cam.height // factor
-    return lowres_cam
-
-
-def _make_lowres_render_func(render_func):
-    def lowres_render_func(in_cam):
-        return render_func(_make_lowres_cam(in_cam))
-
-    return lowres_render_func
-
-
-def get_gaussian_splatting_visualizer(scene_gs, device="cuda"):
-    # scene_gs is supposed to be centered and normalized
-    camera = Camera(
-        extrinsics=CameraExtrinsics.from_lookat(
-            eye=[0, 0, 2], at=[0, 0, 0], up=[0, 1, 0], device=device
-        ),
-        intrinsics=PinholeIntrinsics.from_fov(256, 256, fov=60, device=device),
-    )
-
-    render_fn = _make_render_fn(scene_gs)
-
-    # Create the visualizer
-    vizualizer = IpyTurntableVisualizer(
-        width=256,
-        height=256,
-        camera=camera,
-        render=render_fn,
-        max_fps=10,
-        fast_render=_make_lowres_render_func(render_fn),
-    )
-
-    return vizualizer
+    return scene_gs
 
 
 def check_target(
@@ -346,48 +321,61 @@ def check_hydra_safety(
             to_check.extend(list(node))
 
 
-if __name__ == "__main__":
-    PATH = os.getcwd()
-    TAG = "public_v0"
-    config_path = (
-        f"{PATH}/scripts/gleize/public_release/checkpoints/{TAG}/pipeline.yaml"
-    )
-    inference = Inference(config_path, compile=False)
+def load_image(path):
+    image = Image.open(path)
+    image = np.array(image)
+    image = image.astype(np.uint8)
+    return image
 
-# def prepare_gaussian_outputs(outputs):
-#     all_outs = []
-#     for output in outputs:
-#         PC = SceneVisualizer.object_pointcloud(
-#             points_local=(output["gs"]._xyz - 0.5).unsqueeze(0),
-#             quat_l2c=output["rotation"],
-#             trans_l2c=output["translation"],
-#             scale_l2c=output["scale"],
-#         )
 
-#         output["gs"]._xyz = PC.points_list()[0]
-#         output["gs"]._scaling *= output["scale"]
-#         all_outs.append(output)
+def load_mask(path):
+    mask = load_image(path)
+    mask = mask > 127
+    mask = mask[..., 0]
+    return mask
 
-#     scene_gs = all_outs[0]["gs"]
-#     for out in all_outs[1:]:
-#         out_gs = out["gs"]
-#         scene_gs._xyz = torch.cat([scene_gs._xyz, out_gs._xyz], dim=0)
-#         scene_gs._features_dc = torch.cat(
-#             [scene_gs._features_dc, out_gs._features_dc],
-#             dim=0,
-#         )
-#         scene_gs._scaling = torch.cat([scene_gs._scaling, out_gs._scaling], dim=0)
-#         scene_gs._rotation = torch.cat([scene_gs._rotation, out_gs._rotation], dim=0)
-#         scene_gs._opacity = torch.cat([scene_gs._opacity, out_gs._opacity], dim=0)
 
-#     pose_targets = []
-#     for out in all_outs:
-#         converted_out = {
-#             "xyz_local": (out["coords"][:, 1:] / 64 - 0.5),
-#             "rotation": out["rotation"],
-#             "translation": out["translation"],
-#             "scale": out["scale"],
-#         }
-#         pose_targets.append(converted_out)
+def load_all_masks(folder_path):
+    idx = 0
+    masks = []
+    while os.path.exists(mask_path := os.path.join(folder_path, f"{idx}.jpg")):
+        mask = load_mask(mask_path)
+        masks.append(mask)
+        idx += 1
+    return masks
 
-#     return scene_gs, pose_targets
+
+def display_image(image, masks=None):
+    def imshow(image, ax):
+        ax.axis("off")
+        ax.imshow(image)
+
+    grid = (1, 1) if masks is None else (2, 2)
+    fig, axes = plt.subplots(*grid)
+    if masks is not None:
+        mask_colors = sns.color_palette("husl", len(masks))
+        black_image = np.zeros_like(image[..., :3], dtype=float)  # background
+        mask_display = np.copy(black_image)
+        mask_union = np.zeros_like(image[..., :3])
+        for i, mask in enumerate(masks):
+            mask_display[mask] = mask_colors[i]
+            mask_union |= mask[..., None]
+        imshow(black_image, axes[0, 1])
+        imshow(mask_display, axes[1, 0])
+        imshow(image * mask_union, axes[1, 1])
+
+    image_axe = axes if masks is None else axes[0, 0]
+    imshow(image, image_axe)
+
+    fig.tight_layout(pad=0)
+    fig.show()
+
+
+def interactive_visualizer(ply_path):
+    with gr.Blocks() as demo:
+        gr.Markdown("# 3D Gaussian Splatting (black-screen loading might take a while)")
+        gr.Model3D(
+            value=ply_path,  # splat file
+            label="3D Scene",
+        )
+    demo.launch(share=True)

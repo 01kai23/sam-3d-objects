@@ -21,6 +21,8 @@ from sam3d_objects.data.dataset.tdfy.trellis.dataset import PerSubsetDataset
 from sam3d_objects.data.dataset.tdfy.img_and_mask_transforms import normalize_pointmap_ssi
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
 from copy import deepcopy
+import open3d as o3d
+from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area
 
 
 def recursive_fn_factory(fn):
@@ -212,61 +214,26 @@ class InferencePipelinePointMap(InferencePipeline):
         rgb_image = rgba_image[:3]
         rgb_image_mask = get_mask(rgba_image, None, "ALPHA_CHANNEL")
 
-        # Check if we need to normalize the pointmap for layout preprocessing
-        if pointmap is not None and preprocessor.normalize_pointmap:
-            pointmap, _, _ = normalize_pointmap_ssi(pointmap)
-
-        if (
-            preprocessor.img_mask_pointmap_joint_transform != (None,)
-            and preprocessor.img_mask_pointmap_joint_transform is not None
-            and pointmap is not None
-        ):
-            processed_rgb_image, processed_mask, processed_rgb_pointmap = (
-                self._preprocess_image_and_mask_pointmap(
-                    rgb_image,
-                    rgb_image_mask,
-                    pointmap,
-                    preprocessor.img_mask_pointmap_joint_transform,
-                )
-            )
-        else:
-            processed_rgb_image, processed_mask = self._preprocess_image_and_mask(
-                rgb_image, rgb_image_mask, preprocessor.img_mask_joint_transform
-            )
-            processed_rgb_pointmap = pointmap
-
-        # transform tensor to model input
-        processed_rgb_image = self._apply_transform(
-            processed_rgb_image, preprocessor.img_transform
+        preprocessor_return_dict = preprocessor._process_image_mask_pointmap_mess(
+            rgb_image, rgb_image_mask, pointmap
         )
-        processed_mask = self._apply_transform(
-            processed_mask, preprocessor.mask_transform
-        )
-        if pointmap is not None and preprocessor.pointmap_transform != (None,):
-            processed_rgb_pointmap = self._apply_transform(
-                processed_rgb_pointmap,
-                preprocessor.pointmap_transform,
-            )
-
-        # full image, with only processing from the image
-        rgb_image = self._apply_transform(rgb_image, preprocessor.img_transform)
-        rgb_image_mask = self._apply_transform(
-            rgb_image_mask, preprocessor.mask_transform
-        )
-        if pointmap is not None and preprocessor.pointmap_transform != (None,):
-            full_pointmap = self._apply_transform(
-                pointmap, preprocessor.pointmap_transform
-            )
+        
+        # Put in a for loop?
+        _item = preprocessor_return_dict
         item = {
-            "mask": processed_mask[None].to(self.device),
-            "image": processed_rgb_image[None].to(self.device),
-            "rgb_image": rgb_image[None].to(self.device),
-            "rgb_image_mask": rgb_image_mask[None].to(self.device),
+            "mask": _item["mask"][None].to(self.device),
+            "image": _item["image"][None].to(self.device),
+            "rgb_image": _item["rgb_image"][None].to(self.device),
+            "rgb_image_mask": _item["rgb_image_mask"][None].to(self.device),
         }
 
         if pointmap is not None and preprocessor.pointmap_transform != (None,):
-            item["pointmap"] = processed_rgb_pointmap[None].to(self.device)
-            item["rgb_pointmap"] = full_pointmap[None].to(self.device)
+            item["pointmap"] = _item["pointmap"][None].to(self.device)
+            item["rgb_pointmap"] = _item["rgb_pointmap"][None].to(self.device)
+            item["pointmap_scale"] = _item["pointmap_scale"][None].to(self.device)
+            item["pointmap_shift"] = _item["pointmap_shift"][None].to(self.device)
+            item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
+            item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
 
         return item
 
@@ -301,11 +268,12 @@ class InferencePipelinePointMap(InferencePipeline):
                 ).squeeze(0)
             intrinsics = None
 
+        points_tensor = points_tensor.permute(2, 0, 1)
         # Prepare the point map tensor
-        point_map_tensor = PerSubsetDataset._prepare_pointmap(
-            points_tensor, return_pointmap=True
-        )
-        point_map_tensor["pts_color"] = loaded_image
+        point_map_tensor = {
+            "pointmap": points_tensor,
+            "pts_color": loaded_image,
+        }
 
         # If depth model doesn't provide intrinsics, infer them
         if intrinsics is None:
@@ -356,6 +324,7 @@ class InferencePipelinePointMap(InferencePipeline):
         use_stage2_distillation=False,
         pointmap=None,
         decode_formats=None,
+        estimate_plane=False,
     ) -> dict:
         logger.info("InferencePipelinePointMap.run() called")
         # This should only happen if called from demo
@@ -363,8 +332,9 @@ class InferencePipelinePointMap(InferencePipeline):
         with self.device:  # TODO(Pierre) make with context a decorator ?
             pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
-            pointmap_scale = pointmap_dict["pointmap_scale"]
-            pointmap_shift = pointmap_dict["pointmap_shift"]
+
+            if estimate_plane:
+                return self.estimate_plane(pointmap_dict, image)
 
             ss_input_dict = self.preprocess_image(
                 image, self.ss_preprocessor, pointmap=pointmap
@@ -375,6 +345,8 @@ class InferencePipelinePointMap(InferencePipeline):
                 )
             else:
                 layout_input_dict = {}
+
+
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if seed is not None:
                 torch.manual_seed(seed)
@@ -393,6 +365,15 @@ class InferencePipelinePointMap(InferencePipeline):
                 use_distillation=use_stage1_distillation,
             )
             ss_return_dict.update(layout_return_dict)
+
+            # We could probably use the decoder from the models themselves
+            pointmap_scale = ss_input_dict.get("pointmap_scale", None)
+            pointmap_shift = ss_input_dict.get("pointmap_shift", None)
+            # Overwrite with layout_input_dict values if they exist
+            if "pointmap_scale" in layout_input_dict:
+                pointmap_scale = layout_input_dict["pointmap_scale"]
+            if "pointmap_shift" in layout_input_dict:
+                pointmap_shift = layout_input_dict["pointmap_shift"]
             ss_return_dict.update(
                 self.pose_decoder(
                     ss_return_dict,
@@ -404,7 +385,12 @@ class InferencePipelinePointMap(InferencePipeline):
             if stage1_only:
                 logger.info("Finished!")
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
-                return ss_return_dict
+                return {
+                    **ss_return_dict,
+                    "pointmap": pointmap.cpu().permute((1, 2, 0)),  # HxWx3
+                    # "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
+                }
+                # return ss_return_dict
 
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(
@@ -478,3 +464,47 @@ class InferencePipelinePointMap(InferencePipeline):
             antialias=True,
         )  # -> (1, 3, H/4, W/4)
         return x.squeeze(0)
+
+    def estimate_plane(self, pointmap_dict, image, ground_area_threshold=0.25, min_points=100):
+        assert image.shape[-1] == 4  # rgba format
+        # Extract mask from alpha channel
+        floor_mask = type(self)._down_sample_img(torch.from_numpy(image[..., -1]).float().unsqueeze(0))[0] > 0.5
+        pts = type(self)._down_sample_img(pointmap_dict["pointmap"])
+
+        # Get all points in 3D space (H, W, 3)
+        pts_hwc = pts.cpu().permute((1, 2, 0))
+
+        valid_mask_points = floor_mask.cpu().numpy()
+        # Extract points that fall within the mask
+        if valid_mask_points.any():
+            # Get points within mask
+            masked_points = pts_hwc[valid_mask_points]
+            # Filter out invalid points (zero points from depth estimation failures)
+            valid_points_mask = torch.norm(masked_points, dim=-1) > 1e-6
+            valid_points = masked_points[valid_points_mask]
+            points = valid_points.numpy()
+        else:
+            points = np.array([]).reshape(0, 3)
+     
+        # Calculate area coverage and check num of points
+        overlap_area = estimate_plane_area(floor_mask)
+        has_enough_points = len(points) >= min_points
+
+        logger.info(f"Plane estimation: {len(points)} points, {overlap_area:.3f} area coverage")
+        if overlap_area > ground_area_threshold and has_enough_points:
+            try:
+                mesh = o3d_plane_estimation(points)
+                logger.info("Successfully estimated plane mesh")
+            except Exception as e:
+                logger.error(f"Failed to estimate plane: {e}")
+                mesh = None
+        else:
+            logger.info(f"Skipping plane estimation: area={overlap_area:.3f}, points={len(points)}")
+            mesh = None
+
+        return {
+            "glb": mesh,
+            "translation": torch.tensor([[0.0, 0.0, 0.0]]),
+            "scale": torch.tensor([[1.0, 1.0, 1.0]]),
+            "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        }
