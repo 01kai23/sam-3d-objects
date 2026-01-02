@@ -11,8 +11,8 @@ The following will install the default environment. If you use `conda` instead o
 
 ```bash
 # create sam3d-objects environment
-mamba env create -f environments/default.yml
-mamba activate sam3d-objects
+conda env create -f environments/default.yml
+conda activate sam3d-objects
 
 # for pytorch/cuda dependencies
 export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu121"
